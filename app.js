@@ -64,6 +64,7 @@ function applyGlobalVideoOnly() {
 	localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
 	for (const entry of files.values()) {
 		entry.videoOnlyOverride = null; // follow the global setting
+		if (entry.video) entry.decision = computeDecision(entry);
 		if (entry.tracks) updateCard(entry);
 	}
 	updateGlobalCheckbox();
@@ -200,12 +201,14 @@ function fileVideoOnly(entry) {
 
 function setFileVideoOnly(entry, value) {
 	entry.videoOnlyOverride = value;
+	if (entry.video) entry.decision = computeDecision(entry);
 	updateCard(entry);
 	updateGlobalCheckbox();
 }
 
 function resetFileVideoOnly(entry) {
 	entry.videoOnlyOverride = null; // follow the global setting again
+	if (entry.video) entry.decision = computeDecision(entry);
 	updateCard(entry);
 	updateGlobalCheckbox();
 }
@@ -225,9 +228,45 @@ function updateGlobalCheckbox() {
 		all.length === 0 ? settings.videoOnly : onCount === all.length;
 }
 
+/* ================================================================== */
+/*  Pass-through (no conversion needed)                                */
+/* ================================================================== */
+
+const MP4_FAMILY_EXTS = ['mp4', 'm4v', 'mov'];
+
+/** Is the source file's container in the same family as the selected output format? */
+function sameContainerFamily(entry) {
+	const i = entry.name.toLowerCase().lastIndexOf('.');
+	const ext = i >= 0 ? entry.name.slice(i + 1) : '';
+	return settings.format === 'webm'
+		? ext === 'webm'
+		: MP4_FAMILY_EXTS.includes(ext);
+}
+
 /**
- * Decide what to do with the video stream of a file, based on current
- * settings and the measured video stream bitrate.
+ * A file can be kept as-is (no conversion at all) when:
+ *  - the video stream doesn't need re-encoding (bitrate is reasonable, or
+ *    re-encoding is disabled), AND
+ *  - no stream has to be removed (video-only is off, or the file has no
+ *    audio to remove), AND
+ *  - the source container matches the selected output format (changing the
+ *    container still requires a cheap remux).
+ * Keeping the original file means zero re-encoding and zero quality loss.
+ */
+function passThroughAllowed(entry, decision) {
+	if (decision && decision.reencode) return false;
+	const hasAudio = entry.tracks?.some((t) => t.kind === 'audio') ?? false;
+	if (fileVideoOnly(entry) && hasAudio) return false; // audio must be removed
+	return sameContainerFamily(entry);
+}
+
+function shouldPassThrough(entry) {
+	return passThroughAllowed(entry, entry.decision);
+}
+
+/**
+ * Decide what to do with a file, based on current settings and the
+ * measured video stream bitrate.
  */
 function computeDecision(entry) {
 	if (!entry.video) return null;
@@ -241,41 +280,48 @@ function computeDecision(entry) {
 		measured: v.bitrate,
 		overkill: false,
 		reencode: false,
+		action: null, // reencode | passthrough | remux-audio-removed | remux
 		note: '',
 	};
 
 	if (settings.bitrateMode === 'copy') {
 		d.note = 'never re-encode is selected — the stream is copied when the format allows it';
-		return d;
-	}
-
-	if (v.bitrate == null) {
+	} else if (v.bitrate == null) {
 		if (settings.bitrateMode === 'always') {
 			d.reencode = true;
 			d.note = `bitrate unknown — re-encoding to ~${fmtBitrate(target)}`;
 		} else {
 			d.note = 'video bitrate unknown — no re-encoding decision was made';
 		}
-		return d;
-	}
-
-	d.overkill = v.bitrate > target * OVERKILL_FACTOR;
-
-	if (settings.bitrateMode === 'always') {
-		d.reencode = true;
-		d.note =
-			`source is ${fmtBitrate(v.bitrate)} — always-re-encode selected, ` +
-			`encoding at ~${fmtBitrate(target)} (recommended for ${resLabel})`;
-	} else if (d.overkill) {
-		d.reencode = true;
-		d.note =
-			`source stream is ${fmtBitrate(v.bitrate)} — overkill for ${resLabel} ` +
-			`(recommended ~${fmtBitrate(target)}) — re-encoding at ~${fmtBitrate(target)}`;
 	} else {
-		d.note =
-			`source stream is ${fmtBitrate(v.bitrate)} — reasonable for ${resLabel} ` +
-			`(recommended ~${fmtBitrate(target)}) — stream is copied when possible`;
+		d.overkill = v.bitrate > target * OVERKILL_FACTOR;
+
+		if (settings.bitrateMode === 'always') {
+			d.reencode = true;
+			d.note =
+				`source is ${fmtBitrate(v.bitrate)} — always-re-encode selected, ` +
+				`encoding at ~${fmtBitrate(target)} (recommended for ${resLabel})`;
+		} else if (d.overkill) {
+			d.reencode = true;
+			d.note =
+				`source stream is ${fmtBitrate(v.bitrate)} — overkill for ${resLabel} ` +
+				`(recommended ~${fmtBitrate(target)}) — re-encoding at ~${fmtBitrate(target)}`;
+		} else {
+			d.note =
+				`source stream is ${fmtBitrate(v.bitrate)} — reasonable for ${resLabel} ` +
+				`(recommended ~${fmtBitrate(target)}) — no re-encoding needed`;
+		}
 	}
+
+	// what happens to the file itself
+	const hasAudio = entry.tracks?.some((t) => t.kind === 'audio') ?? false;
+	d.action = d.reencode
+		? 'reencode'
+		: passThroughAllowed(entry, d)
+			? 'passthrough'
+			: fileVideoOnly(entry) && hasAudio
+				? 'remux-audio-removed'
+				: 'remux';
 	return d;
 }
 
@@ -477,6 +523,7 @@ async function runTranscode(entry) {
 	entry.bytesWritten = 0;
 	entry.conversion = null;
 	entry.decision = computeDecision(entry); // re-evaluate under current settings
+	entry.discarded = [];
 	// A new output is about to replace the old one — drop the old download URL.
 	if (entry.objectUrl) {
 		URL.revokeObjectURL(entry.objectUrl);
@@ -486,6 +533,18 @@ async function runTranscode(entry) {
 	updateCard(entry);
 
 	try {
+		// Nothing needs to change: keep the original file as-is.
+		const noConversion = entry.decision
+			? entry.decision.action === 'passthrough'
+			: shouldPassThrough(entry);
+		if (noConversion) {
+			entry.output = { blob: entry.file, size: entry.file.size, ext: null, passthrough: true };
+			entry.status = 'done';
+			entry.progress = 1;
+			updateCard(entry);
+			return;
+		}
+
 		const input = new Input({
 			formats: ALL_FORMATS,
 			source: new BlobSource(entry.file),
@@ -798,6 +857,29 @@ function computeExcluded(entry) {
 	return entry.tracks.filter((t) => !keep.has(`${t.kind}:${t.number}`));
 }
 
+/**
+ * What will happen to the primary audio track of this file. Audio is never
+ * re-encoded unnecessarily: when the output format can store the source
+ * codec, the stream is copied as-is; otherwise (e.g. AAC audio into WebM)
+ * it is re-encoded to a codec the format supports.
+ */
+function describeAudioAction(entry) {
+	if (fileVideoOnly(entry)) return '';
+	// Pass-through keeps the original file untouched — no conversion, so no
+	// per-track prediction is needed (the chip already says so).
+	if (entry.decision?.action === 'passthrough') return '';
+	const a1 = entry.tracks?.find((t) => t.kind === 'audio');
+	if (!a1 || !a1.codec) return '';
+	const supported =
+		(settings.format === 'webm' ? new WebMOutputFormat() : new Mp4OutputFormat())
+			.getSupportedAudioCodecs();
+	const fmtName = settings.format === 'webm' ? 'WebM' : 'MP4';
+	if (supported.includes(a1.codec)) {
+		return `Audio: ${a1.codec} will be copied, not re-encoded`;
+	}
+	return `Audio: ${a1.codec} will be re-encoded (${a1.codec} cannot be stored in ${fmtName})`;
+}
+
 function renderDecision(entry) {
 	const d = entry.dom;
 	d.decision.innerHTML = '';
@@ -816,14 +898,17 @@ function renderDecision(entry) {
 	const dec = entry.decision;
 	if (!dec) return;
 	const chip = el('span', `chip ${dec.reencode ? 'warn' : 'ok'}`);
-	chip.textContent = dec.reencode
-		? `re-encode → ~${fmtBitrate(dec.target)}`
-		: 'keep stream (copy when possible)';
+	chip.textContent =
+		dec.action === 'reencode' ? `re-encode → ~${fmtBitrate(dec.target)}`
+		: dec.action === 'passthrough' ? 'no conversion — original file kept'
+		: dec.action === 'remux-audio-removed' ? 'remux — video copied, audio removed'
+		: `remux — video copied → ${settings.format === 'webm' ? 'WebM' : 'MP4'}`;
 	const note = el('span', 'note');
 	note.textContent = dec.note || '';
 	d.decision.append(chip, note);
 
-	const excluded = computeExcluded(entry);
+	// pass-through keeps every stream of the original file
+	const excluded = dec.action === 'passthrough' ? [] : computeExcluded(entry);
 	const parts = [];
 	if (excluded.length) {
 		parts.push(
@@ -832,6 +917,8 @@ function renderDecision(entry) {
 				.join(' · ')}`
 		);
 	}
+	const audioAction = describeAudioAction(entry);
+	if (audioAction) parts.push(audioAction);
 	const disc = describeDiscarded(entry.discarded);
 	if (disc) parts.push(`Discarded: ${disc}`);
 	d.discarded.textContent = parts.join(' · ');
@@ -878,18 +965,22 @@ function renderResult(entry) {
 	d.result.innerHTML = '';
 
 	if (!entry.objectUrl) entry.objectUrl = URL.createObjectURL(entry.output.blob);
+	const isPT = !!entry.output.passthrough;
 	const diff = 1 - entry.output.size / entry.size;
 	const diffText = `${diff >= 0 ? '−' : '+'}${Math.abs(Math.round(diff * 100))}%`;
 
 	const top = el('div', 'result-top');
 	const line = el('div', 'result-line');
-	line.textContent = `Result: ${fmtBytes(entry.output.size)} (${diffText} vs input)`;
+	line.textContent = isPT
+		? `No conversion — original file kept as-is (${fmtBytes(entry.output.size)})`
+		: `Result: ${fmtBytes(entry.output.size)} (${diffText} vs input)`;
 	const actions = el('div', 'result-actions');
 	const dl = document.createElement('a');
 	dl.className = 'btn primary';
 	dl.href = entry.objectUrl;
-	dl.download = outputName(entry.name, entry.output.ext);
-	dl.textContent = `Download ${dl.download}`;
+	const dlName = isPT ? entry.name : outputName(entry.name, entry.output.ext);
+	dl.download = dlName;
+	dl.textContent = isPT ? `Download original file` : `Download ${dlName}`;
 	const playBtn = el('button', 'btn');
 	playBtn.textContent = 'Play ▸';
 	playBtn.title = 'Open in a bigger window';
@@ -941,7 +1032,9 @@ function openModal(entry) {
 	if (!entry.output || !entry.objectUrl) return;
 	closeModal(); // release any previous video
 	modal.entry = entry;
-	modal.title.textContent = `${entry.name} → ${outputName(entry.name, entry.output.ext)}`;
+	modal.title.textContent = entry.output.passthrough
+		? entry.name
+		: `${entry.name} → ${outputName(entry.name, entry.output.ext)}`;
 	modal.video.src = entry.objectUrl;
 	modal.root.classList.remove('hidden');
 	modal.video.play().catch(() => {}); // user can press the modal's play control

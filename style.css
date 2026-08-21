@@ -1,4 +1,4 @@
-/* ---------- Web Transcoder ---------- */
+/* ---------- Media Transcoder ---------- */
 
 :root {
 	--bg: #0d1117;
@@ -37,6 +37,13 @@ body {
 header h1 {
 	margin: 0 0 4px;
 	font-size: 26px;
+}
+
+header h1 .logo {
+	height: 60px;
+	width: auto;
+	vertical-align: middle;
+	margin-right: 6px;
 }
 
 .subtitle {
