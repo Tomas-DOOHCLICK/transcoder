@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Web Transcoder</title>
+	<link rel="stylesheet" href="style.css">
+	<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐰</text></svg>">
+</head>
+<body>
+	<header>
+		<h1>🐰 Web Transcoder</h1>
+		<p class="subtitle">
+			Local video transcoding in your browser, powered by
+			<a href="https://mediabunny.dev" target="_blank" rel="noopener">Mediabunny</a>.
+			Files are processed on this machine and never leave it.
+		</p>
+	</header>
+
+	<div id="webcodecs-warning" class="banner hidden"></div>
+
+	<section class="settings" aria-label="Settings">
+		<div class="setting">
+			<label for="set-video-only">
+				<input type="checkbox" id="set-video-only">
+				<span><strong>Video only</strong><br><small>remove all other streams (audio etc.)</small></span>
+			</label>
+		</div>
+		<div class="setting">
+			<label for="set-bitrate-mode">Bitrate</label>
+			<select id="set-bitrate-mode">
+				<option value="auto">Auto — re-encode if bitrate is overkill</option>
+				<option value="always">Always re-encode to target bitrate</option>
+				<option value="copy">Never re-encode (copy when possible)</option>
+			</select>
+		</div>
+		<div class="setting">
+			<label for="set-format">Output</label>
+			<select id="set-format">
+				<option value="mp4">MP4</option>
+				<option value="webm">WebM</option>
+			</select>
+		</div>
+		<div class="setting-buttons">
+			<button id="btn-transcode-all" class="btn primary" disabled>Transcode all</button>
+			<button id="btn-clear" class="btn" disabled>Clear all</button>
+		</div>
+		<p class="settings-note">
+			Auto mode: a video stream is re-encoded when its bitrate is more than 1.5× the recommended value
+			for its resolution &amp; frame rate (e.g. ~8 Mbps for 1080p30).
+		</p>
+	</section>
+
+	<section class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="Add video files">
+		<p><strong>Drop video files here</strong> or click to browse</p>
+		<p class="small">Multiple files supported · MP4, WebM, MOV, MKV, AVI, MP3, WAV, HLS…</p>
+		<input type="file" id="file-input" multiple hidden>
+	</section>
+
+	<section id="file-list" aria-label="Files"></section>
+
+	<footer>
+		Files are transcoded in your browser using WebCodecs — no uploads, no server.
+		Outputs are kept in memory; download them to save.
+	</footer>
+
+	<script type="module" src="app.js"></script>
+</body>
+</html>
