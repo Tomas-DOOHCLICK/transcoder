@@ -468,6 +468,7 @@ async function analyze(entry) {
 			err?.name === 'UnsupportedInputFormatError'
 				? `Unsupported or unrecognized file format: ${entry.name}`
 				: err?.message || String(err);
+		entry.errorStack = err?.stack || '';
 		updateCard(entry);
 		refreshGlobalButtons();
 	}
@@ -498,6 +499,9 @@ function queueTranscode(entry) {
 	if (!['ready', 'done', 'canceled'].includes(entry.status)) return;
 	entry.status = 'queued';
 	entry.error = null;
+	entry.errorName = '';
+	entry.errorStack = '';
+	entry.errorAt = null;
 	updateCard(entry);
 	queue.push(entry.id);
 	refreshGlobalButtons();
@@ -642,6 +646,9 @@ async function runTranscode(entry) {
 		} else {
 			entry.status = 'error';
 			entry.error = err?.message || String(err);
+			entry.errorName = err?.name || '';
+			entry.errorStack = err?.stack || '';
+			entry.errorAt = entry.progress; // how far into the file it got
 		}
 		updateCard(entry);
 	} finally {
@@ -819,8 +826,18 @@ function renderStreams(entry) {
 		d.tbody.appendChild(tr);
 		return;
 	}
+	// Tracks that will not be part of the output get marked in the table.
+	// Pass-through keeps every stream of the original file — nothing marked.
+	const dec = entry.decision;
+	const passthrough = dec != null && dec.action === 'passthrough';
+	const excluded = passthrough
+		? new Set()
+		: new Set(computeExcluded(entry).map((t) => `${t.kind}:${t.number}`));
+
 	for (const t of entry.tracks) {
 		const tr = el('tr');
+		const isExcluded = excluded.has(`${t.kind}:${t.number}`);
+		if (isExcluded) tr.className = 'excluded';
 		const cells = [
 			String(t.number),
 			t.kind,
@@ -832,10 +849,20 @@ function renderStreams(entry) {
 		cells.forEach((text, i) => {
 			const td = el('td');
 			td.textContent = text;
-			if (i === 1) td.className = `type-${t.kind}`;
+			if (i === 1) {
+				td.className = `type-${t.kind}`;
+				if (isExcluded) {
+					const b = el('span', 'badge-removed');
+					b.textContent = ' ✂ removed';
+					td.appendChild(b);
+				}
+			}
 			tr.appendChild(td);
 		});
-		tr.title = t.bitrate != null ? `bitrate: ${t.bitrateSource || 'unknown source'}` : '';
+		const titleBits = [];
+		if (t.bitrate != null) titleBits.push(`bitrate: ${t.bitrateSource || 'unknown source'}`);
+		if (isExcluded) titleBits.push('not included in output');
+		tr.title = titleBits.join(' · ');
 		d.tbody.appendChild(tr);
 	}
 }
@@ -1002,8 +1029,9 @@ function renderResult(entry) {
 	});
 	video.addEventListener('error', () => {
 		if (!video.error) return;
+		const code = video.error.code;
 		status.className = 'preview-status err';
-		status.textContent = `preview error: ${PREVIEW_ERROR_TEXT[video.error.code] || video.error.code}`;
+		status.textContent = `preview error: ${PREVIEW_ERROR_TEXT[code] || 'unknown'} (code ${code})`;
 	});
 	const wrap = el('div', 'preview-wrap');
 	wrap.append(video, status);
@@ -1025,8 +1053,20 @@ const modal = {
 	root: document.getElementById('modal'),
 	title: document.getElementById('modal-title'),
 	video: document.getElementById('modal-video'),
+	status: document.getElementById('modal-status'),
 	entry: null,
 };
+
+// The modal <video> is persistent, so attach the error handler once:
+// if the converted output cannot be played, say why instead of failing silently.
+modal.video.addEventListener('error', () => {
+	if (!modal.video.error) return;
+	const code = modal.video.error.code;
+	modal.status.textContent = `cannot play: ${
+		PREVIEW_ERROR_TEXT[code] || 'unknown error'
+	} (code ${code}) — the output may be damaged or use a format this browser cannot decode`;
+	modal.status.classList.remove('hidden');
+});
 
 function openModal(entry) {
 	if (!entry.output || !entry.objectUrl) return;
@@ -1036,6 +1076,7 @@ function openModal(entry) {
 		? entry.name
 		: `${entry.name} → ${outputName(entry.name, entry.output.ext)}`;
 	modal.video.src = entry.objectUrl;
+	modal.status.classList.add('hidden');
 	modal.root.classList.remove('hidden');
 	modal.video.play().catch(() => {}); // user can press the modal's play control
 }
@@ -1111,7 +1152,58 @@ function updateCard(entry) {
 	}
 
 	renderResult(entry);
-	d.error.textContent = entry.error || '';
+	renderError(entry);
+}
+
+/**
+ * Render the card's error area with as much diagnostic context as
+ * available: the message, where the conversion got stuck, a hint for
+ * decoder errors (usually a corrupted source file) and the full stack
+ * behind a <details> element.
+ */
+function renderError(entry) {
+	const d = entry.dom;
+	d.error.innerHTML = '';
+	if (!entry.error) return;
+
+	const msg = el('div', 'error-msg');
+	msg.textContent = entry.error;
+	d.error.appendChild(msg);
+
+	if (entry.errorAt != null && entry.errorAt > 0 && entry.errorAt < 1) {
+		const sub = el('div', 'error-sub');
+		sub.textContent = `failed at ~${Math.round(entry.errorAt * 100)}% into the file`;
+		d.error.appendChild(sub);
+	}
+
+	// Decoder failures usually mean the source stream itself is damaged or
+	// uses a format this browser cannot decode. Browsers' decoders are
+	// strict and stop at the first unrecoverable frame, while tools like
+	// ffmpeg resync and continue — so a re-encode often salvages the file.
+	if (/decoder|decod/i.test(`${entry.errorName || ''} ${entry.error}`)) {
+		const hint = el('div', 'error-hint');
+		const p = document.createElement('div');
+		p.textContent =
+			'The video stream could not be decoded — the source file may be ' +
+			'corrupted. Re-encoding it with ffmpeg often recovers such files:';
+		const code = document.createElement('code');
+		code.textContent =
+			`ffmpeg -i ${entry.name} -c:v libx264 -preset fast -crf 20 -c:a copy repaired.mp4`;
+		const p2 = document.createElement('div');
+		p2.textContent = '…then convert repaired.mp4 here.';
+		hint.append(p, code, p2);
+		d.error.appendChild(hint);
+	}
+
+	if (entry.errorStack || entry.errorName) {
+		const det = document.createElement('details');
+		const sum = document.createElement('summary');
+		sum.textContent = `technical details${entry.errorName ? ` — ${entry.errorName}` : ''}`;
+		const pre = document.createElement('pre');
+		pre.textContent = entry.errorStack || entry.errorName;
+		det.append(sum, pre);
+		d.error.appendChild(det);
+	}
 }
 
 /* Throttled progress painting (rAF). */
