@@ -19,7 +19,7 @@ const {
 
 const SETTINGS_KEY = 'web-transcoder-settings';
 const defaultSettings = {
-	videoOnly: false,     // remove all streams except the video
+	videoOnly: true,     // default for new files; each file can override it
 	bitrateMode: 'auto', // auto | always | copy
 	format: 'mp4',       // mp4 | webm
 };
@@ -42,7 +42,6 @@ const els = {
 };
 
 function saveSettings() {
-	settings.videoOnly = els.videoOnly.checked;
 	settings.bitrateMode = els.bitrateMode.value;
 	settings.format = els.format.value;
 	localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -55,13 +54,28 @@ function saveSettings() {
 	}
 }
 
-function applySettingsToUi() {
-	els.videoOnly.checked = settings.videoOnly;
-	els.bitrateMode.value = settings.bitrateMode;
-	els.format.value = settings.format;
+/**
+ * The global “video only” toggle applies to all files at once, clearing
+ * any per-file overrides. (When the checkbox is indeterminate, a click
+ * checks it — the standard “set everything to on” behavior.)
+ */
+function applyGlobalVideoOnly() {
+	settings.videoOnly = els.videoOnly.checked;
+	localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+	for (const entry of files.values()) {
+		entry.videoOnlyOverride = null; // follow the global setting
+		if (entry.tracks) updateCard(entry);
+	}
+	updateGlobalCheckbox();
 }
 
-els.videoOnly.addEventListener('change', saveSettings);
+function applySettingsToUi() {
+	els.bitrateMode.value = settings.bitrateMode;
+	els.format.value = settings.format;
+	updateGlobalCheckbox();
+}
+
+els.videoOnly.addEventListener('change', applyGlobalVideoOnly);
 els.bitrateMode.addEventListener('change', saveSettings);
 els.format.addEventListener('change', saveSettings);
 
@@ -170,6 +184,47 @@ function targetVideoBitrate(width, height, fps) {
 /** A measured bitrate above 1.5× the recommended value counts as "overkill". */
 const OVERKILL_FACTOR = 1.5;
 
+/* ================================================================== */
+/*  Per-file “video only” override                                     */
+/* ================================================================== */
+
+/**
+ * Effective “video only” for a file: its per-file override if set,
+ * otherwise the global default.
+ */
+function fileVideoOnly(entry) {
+	return entry.videoOnlyOverride !== null
+		? entry.videoOnlyOverride
+		: settings.videoOnly;
+}
+
+function setFileVideoOnly(entry, value) {
+	entry.videoOnlyOverride = value;
+	updateCard(entry);
+	updateGlobalCheckbox();
+}
+
+function resetFileVideoOnly(entry) {
+	entry.videoOnlyOverride = null; // follow the global setting again
+	updateCard(entry);
+	updateGlobalCheckbox();
+}
+
+/**
+ * Keep the global “video only” checkbox in sync with the files: checked
+ * when every file is on, unchecked when every file is off, and the
+ * standard indeterminate (dash) state while individual files are set
+ * differently from each other.
+ */
+function updateGlobalCheckbox() {
+	const all = [...files.values()];
+	const onCount = all.filter(fileVideoOnly).length;
+	els.videoOnly.indeterminate =
+		all.length > 0 && onCount > 0 && onCount < all.length;
+	els.videoOnly.checked =
+		all.length === 0 ? settings.videoOnly : onCount === all.length;
+}
+
 /**
  * Decide what to do with the video stream of a file, based on current
  * settings and the measured video stream bitrate.
@@ -240,6 +295,7 @@ function makeEntry(file) {
 		tracks: null, // analyzed stream metadata
 		video: null,  // { width, height, fps, codec, bitrate, bitrateSource }
 		decision: null,
+		videoOnlyOverride: null, // null = follow the global setting
 		progress: 0,
 		bytesWritten: 0,
 		output: null,  // { blob, size, ext }
@@ -262,6 +318,7 @@ function addFiles(fileList) {
 		fileList instanceof File ? [fileList] : Array.from(fileList);
 	for (const file of arr) makeEntry(file);
 	refreshGlobalButtons();
+	updateGlobalCheckbox();
 }
 
 /* ================================================================== */
@@ -463,7 +520,7 @@ async function runTranscode(entry) {
 			input,
 			output,
 			tracks: 'primary', // only the primary video + primary audio track
-			audio: settings.videoOnly ? { discard: true } : undefined,
+			audio: fileVideoOnly(entry) ? { discard: true } : undefined,
 		};
 		if (entry.decision && entry.decision.reencode) {
 			options.video = {
@@ -551,10 +608,12 @@ function removeFile(entry) {
 	const i = queue.indexOf(entry.id);
 	if (i !== -1) queue.splice(i, 1);
 	if (activeId === entry.id) entry.conversion?.cancel().catch(() => {});
+	if (modal.entry === entry) closeModal();
 	files.delete(entry.id);
 	entry.dom?.root.remove();
 	if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl);
 	refreshGlobalButtons();
+	updateGlobalCheckbox();
 }
 
 /* ================================================================== */
@@ -596,6 +655,24 @@ function buildCard(entry) {
 	controls.append(badge, btnTranscode, btnCancel, btnRemove);
 	head.append(ident, controls);
 
+	// per-file “video only” toggle (defaults to the global setting)
+	const settingsRow = el('div', 'card-settings');
+	const voLabel = el('label', 'card-setting');
+	const voBox = document.createElement('input');
+	voBox.type = 'checkbox';
+	voBox.checked = fileVideoOnly(entry);
+	voBox.title = 'Keep only the video stream(s) — remove audio and all other streams';
+	voBox.addEventListener('change', () => setFileVideoOnly(entry, voBox.checked));
+	const voText = el('span');
+	voText.textContent = 'Video only';
+	voLabel.append(voBox, voText);
+	const voReset = el('button', 'btn small');
+	voReset.textContent = '↺ follow global';
+	voReset.title = 'Use the global “Video only” setting for this file';
+	voReset.hidden = true;
+	voReset.addEventListener('click', () => resetFileVideoOnly(entry));
+	settingsRow.append(voLabel, voReset);
+
 	const table = el('table', 'streams');
 	const thead = el('thead');
 	const headRow = el('tr');
@@ -623,7 +700,7 @@ function buildCard(entry) {
 	result.hidden = true;
 	const error = el('div', 'card-error');
 
-	root.append(head, table, decision, discarded, progressArea, result, error);
+	root.append(head, settingsRow, table, decision, discarded, progressArea, result, error);
 
 	btnTranscode.addEventListener('click', () => queueTranscode(entry));
 	btnCancel.addEventListener('click', () => cancelTranscode(entry));
@@ -636,6 +713,8 @@ function buildCard(entry) {
 		btnTranscode,
 		btnCancel,
 		tbody,
+		videoOnlyBox: voBox,
+		videoOnlyReset: voReset,
 		decision,
 		discarded,
 		progressArea,
@@ -705,14 +784,14 @@ function renderStreams(entry) {
 /**
  * Predicted (setting-based) list of input tracks that will not be part of
  * the output: everything except the primary video track, and — unless
- * "video only" is enabled — the primary audio track.
+ * "video only" is enabled for this file — the primary audio track.
  */
 function computeExcluded(entry) {
 	if (!entry.tracks || !entry.tracks.length) return [];
 	const keep = new Set();
 	const v1 = entry.tracks.find((t) => t.kind === 'video');
 	if (v1) keep.add(`video:${v1.number}`);
-	if (!settings.videoOnly) {
+	if (!fileVideoOnly(entry)) {
 		const a1 = entry.tracks.find((t) => t.kind === 'audio');
 		if (a1) keep.add(`audio:${a1.number}`);
 	}
@@ -758,11 +837,41 @@ function renderDecision(entry) {
 	d.discarded.textContent = parts.join(' · ');
 }
 
+const PREVIEW_ERROR_TEXT = {
+	1: 'aborted',
+	2: 'network error',
+	3: 'decode error',
+	4: 'source not supported by this browser',
+};
+
+/**
+ * Start (or restart) the in-card preview of the transcoded output.
+ * The preview is muted & looping: muted autoplay is always permitted, and
+ * the audio track is still decoded, so audio problems are caught too.
+ */
+function startPreview(entry) {
+	const video = entry.dom.preview;
+	const status = entry.dom.previewStatus;
+	if (!video || !status || !entry.objectUrl) return;
+	if (video.src === entry.objectUrl && video.readyState >= 2) return;
+	video.src = entry.objectUrl;
+	status.className = 'preview-status';
+	status.textContent = 'previewing…';
+	video.play().catch(() => {
+		if (status.textContent === 'previewing…') {
+			status.className = 'preview-status warn';
+			status.textContent = 'autoplay blocked — click the preview';
+		}
+	});
+}
+
 function renderResult(entry) {
 	const d = entry.dom;
 	if (!entry.output) {
 		d.result.hidden = true;
 		d.result.innerHTML = '';
+		d.preview = null;
+		d.previewStatus = null;
 		return;
 	}
 	d.result.hidden = false;
@@ -772,15 +881,86 @@ function renderResult(entry) {
 	const diff = 1 - entry.output.size / entry.size;
 	const diffText = `${diff >= 0 ? '−' : '+'}${Math.abs(Math.round(diff * 100))}%`;
 
+	const top = el('div', 'result-top');
 	const line = el('div', 'result-line');
 	line.textContent = `Result: ${fmtBytes(entry.output.size)} (${diffText} vs input)`;
-	const a = document.createElement('a');
-	a.className = 'btn primary';
-	a.href = entry.objectUrl;
-	a.download = outputName(entry.name, entry.output.ext);
-	a.textContent = `Download ${a.download}`;
-	d.result.append(line, a);
+	const actions = el('div', 'result-actions');
+	const dl = document.createElement('a');
+	dl.className = 'btn primary';
+	dl.href = entry.objectUrl;
+	dl.download = outputName(entry.name, entry.output.ext);
+	dl.textContent = `Download ${dl.download}`;
+	const playBtn = el('button', 'btn');
+	playBtn.textContent = 'Play ▸';
+	playBtn.title = 'Open in a bigger window';
+	playBtn.addEventListener('click', () => openModal(entry));
+	actions.append(dl, playBtn);
+	top.append(line, actions);
+
+	const status = el('span', 'preview-status');
+	const video = el('video', 'preview');
+	video.playsInline = true;
+	video.muted = true;
+	video.loop = true;
+	video.preload = 'auto';
+	video.title = 'Click to open in a bigger window';
+	video.addEventListener('click', () => openModal(entry));
+	video.addEventListener('playing', () => {
+		status.className = 'preview-status ok';
+		status.textContent = 'preview OK ✓';
+	});
+	video.addEventListener('error', () => {
+		if (!video.error) return;
+		status.className = 'preview-status err';
+		status.textContent = `preview error: ${PREVIEW_ERROR_TEXT[video.error.code] || video.error.code}`;
+	});
+	const wrap = el('div', 'preview-wrap');
+	wrap.append(video, status);
+
+	d.result.append(top, wrap);
+	d.preview = video;
+	d.previewStatus = status;
+
+	// Auto-preview the converted video as soon as transcoding is done,
+	// so that any encoding errors become visible right away.
+	if (entry.status === 'done') startPreview(entry);
 }
+
+/* ================================================================== */
+/*  Full-window preview modal                                          */
+/* ================================================================== */
+
+const modal = {
+	root: document.getElementById('modal'),
+	title: document.getElementById('modal-title'),
+	video: document.getElementById('modal-video'),
+	entry: null,
+};
+
+function openModal(entry) {
+	if (!entry.output || !entry.objectUrl) return;
+	closeModal(); // release any previous video
+	modal.entry = entry;
+	modal.title.textContent = `${entry.name} → ${outputName(entry.name, entry.output.ext)}`;
+	modal.video.src = entry.objectUrl;
+	modal.root.classList.remove('hidden');
+	modal.video.play().catch(() => {}); // user can press the modal's play control
+}
+
+function closeModal() {
+	if (modal.root.classList.contains('hidden')) return;
+	modal.video.pause();
+	modal.video.removeAttribute('src');
+	modal.video.load();
+	modal.root.classList.add('hidden');
+	modal.entry = null;
+}
+
+document.getElementById('modal-close').addEventListener('click', closeModal);
+document.getElementById('modal-backdrop').addEventListener('click', closeModal);
+document.addEventListener('keydown', (e) => {
+	if (e.key === 'Escape') closeModal();
+});
 
 function updateCard(entry) {
 	const d = entry.dom;
@@ -809,6 +989,10 @@ function updateCard(entry) {
 
 	renderStreams(entry);
 	renderDecision(entry);
+
+	// per-file “video only” toggle: checked state + “follow global” reset
+	d.videoOnlyBox.checked = fileVideoOnly(entry);
+	d.videoOnlyReset.hidden = entry.videoOnlyOverride === null;
 
 	// buttons
 	const busy = entry.status === 'queued' || entry.status === 'converting';

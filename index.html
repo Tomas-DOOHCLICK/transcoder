@@ -21,9 +21,9 @@
 
 	<section class="settings" aria-label="Settings">
 		<div class="setting">
-			<label for="set-video-only">
-				<input type="checkbox" id="set-video-only">
-				<span><strong>Video only</strong><br><small>remove all other streams (audio etc.)</small></span>
+			<label for="set-video-only" title="Applies to all files and clears per-file overrides">
+				<input type="checkbox" id="set-video-only" checked>
+				<span><strong>Video only</strong> (all files)<br><small>remove all other streams (audio etc.) — dash shown while files differ; each file can be toggled on its card</small></span>
 			</label>
 		</div>
 		<div class="setting">
@@ -47,7 +47,9 @@
 		</div>
 		<p class="settings-note">
 			Auto mode: a video stream is re-encoded when its bitrate is more than 1.5× the recommended value
-			for its resolution &amp; frame rate (e.g. ~8 Mbps for 1080p30).
+			for its resolution &amp; frame rate (e.g. ~8 Mbps for 1080p30).<br>
+			“Video only” is a per-file setting (default: <b>on</b>) — toggle it on each file’s card, or use the
+			global switch above to set it for all files at once.
 		</p>
 	</section>
 
@@ -58,6 +60,17 @@
 	</section>
 
 	<section id="file-list" aria-label="Files"></section>
+
+	<div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Video preview">
+		<div class="modal-backdrop" id="modal-backdrop"></div>
+		<div class="modal-box">
+			<div class="modal-head">
+				<span id="modal-title" class="modal-title"></span>
+				<button id="modal-close" class="btn" aria-label="Close preview">✕</button>
+			</div>
+			<video id="modal-video" controls playsinline></video>
+		</div>
+	</div>
 
 	<footer>
 		Files are transcoded in your browser using WebCodecs — no uploads, no server.
